@@ -7,8 +7,10 @@
  *     using Strassen matrix multiplication.
  *   - Strassen multiplication uses OpenMP tasks for parallelism and AVX2 intrinsics
  *     for the base-case multiplication.
- *   - After multiplication, checks for division by 0.0 and normalizes P by dividing
- *     each entry by the largest entry in P’s first row.
+ *   - After multiplication, checks for division by 0.0 and normalizes P using the
+ *     affine mapping:
+ *         f(x) = (x - minP) / (maxP - minP)
+ *     where minP and maxP are the minimum and maximum entries in P.
  *   - The program loops indefinitely (use Ctrl+C to exit).
  */
 
@@ -17,6 +19,7 @@
 #include <math.h>
 #include <immintrin.h>
 #include <omp.h>
+#include <time.h>
 
 // Function to compute the next power of 2 greater than or equal to n.
 int nextPowerOf2(int n) {
@@ -130,7 +133,7 @@ void strassenMultiply(double **A, double **B, double **C, int n) {
     #pragma omp task shared(M1, T1, T2) if(newSize > 64)
     {
         addMatrix(A11, A22, T1, newSize);      // T1 = A11 + A22
-        addMatrix(B11, B22, T2, newSize);      // T2 = B11 + B22
+        addMatrix(B11, B22, T2, newSize);        // T2 = B11 + B22
         strassenMultiply(T1, T2, M1, newSize);
     }
 
@@ -237,115 +240,253 @@ void unpadMatrix(double **pad, double **mat, int n, int m) {
 }
 
 int main(void) {
-    while (1) {
-        int n, i, j;
+    // Seed the random number generator.
+    srand(time(NULL));
+
+    int mode;
+    printf("Choose mode:\n");
+    printf("  (1) Chain Mode (random initial vector with normalized first row fed as next input)\n");
+    printf("  (2) Manual Input Mode\n");
+    printf("Enter mode (1 or 2): ");
+    if (scanf("%d", &mode) != 1) {
+        printf("Invalid input.\n");
+        return 1;
+    }
+
+    if (mode == 1) {
+        int n, iterations;
         printf("Enter the size of the vector: ");
         if (scanf("%d", &n) != 1 || n <= 0) {
-            printf("Invalid size. Please enter a positive integer.\n");
-            while(getchar() != '\n');
-            continue;
+            printf("Invalid size.\n");
+            return 1;
+        }
+        printf("Enter the number of chain iterations (enter 0 for infinite loop): ");
+        if (scanf("%d", &iterations) != 1) {
+            printf("Invalid input.\n");
+            return 1;
         }
 
-        // Allocate and read the input vector.
+        // Generate the initial random vector with values in [-10, 10].
         double *vector = (double *)malloc(n * sizeof(double));
-        if (!vector) {
-            printf("Memory allocation failed.\n");
-            exit(1);
+        for (int i = 0; i < n; i++) {
+            double r = ((double)rand() / RAND_MAX) * 20.0 - 10.0;
+            vector[i] = r;
         }
-        printf("Enter %d vector element(s): ", n);
-        for (i = 0; i < n; i++) {
-            if (scanf("%lf", &vector[i]) != 1) {
-                printf("Invalid input. Restarting iteration.\n");
-                while(getchar() != '\n');
-                free(vector);
-                vector = NULL;
-                break;
+
+        int iter = 0;
+        while (iterations == 0 || iter < iterations) {
+            printf("\n=== Chain Iteration %d ===\n", iter + 1);
+            printf("Input Vector:\n");
+            for (int i = 0; i < n; i++) {
+                printf("%.2lf ", vector[i]);
             }
-        }
-        if (!vector)
-            continue;
+            printf("\n");
 
-        // Construct the Latin square matrix M from the vector.
-        double **M = allocateMatrix(n);
-        for (i = 0; i < n; i++)
-            for (j = 0; j < n; j++)
-                M[i][j] = vector[(j + i) % n];
+            // Construct the Latin square matrix M from the vector.
+            double **M = allocateMatrix(n);
+            for (int i = 0; i < n; i++)
+                for (int j = 0; j < n; j++)
+                    M[i][j] = vector[(j + i) % n];
 
-        // Determine padded size (power of 2) and pad M if necessary.
-        int m = nextPowerOf2(n);
-        double **M_pad = (m == n) ? M : padMatrix(M, n, m);
+            // Determine padded size (power of 2) and pad M if necessary.
+            int m = nextPowerOf2(n);
+            double **M_pad = (m == n) ? M : padMatrix(M, n, m);
+            double **P_pad = allocateMatrix(m);
 
-        // Allocate padded product matrix.
-        double **P_pad = allocateMatrix(m);
-
-        // Perform Strassen multiplication in a parallel region.
-        #pragma omp parallel
-        {
-            #pragma omp single
+            // Compute P = M * M using Strassen multiplication.
+            #pragma omp parallel
             {
-                strassenMultiply(M_pad, M_pad, P_pad, m);
+                #pragma omp single
+                {
+                    strassenMultiply(M_pad, M_pad, P_pad, m);
+                }
             }
-        }
 
-        // Unpad product matrix P_pad into P (n x n).
-        double **P = allocateMatrix(n);
-        if(m != n) {
-            unpadMatrix(P_pad, P, n, m);
-        } else {
-            // If no padding was done, copy directly.
-            for (i = 0; i < n; i++)
-                for (j = 0; j < n; j++)
-                    P[i][j] = P_pad[i][j];
-        }
-
-        // Find the largest entry in the first row of P.
-        double max = P[0][0];
-        for (j = 1; j < n; j++) {
-            if (P[0][j] > max)
-                max = P[0][j];
-        }
-
-        // Print matrix M.
-        printf("\nMatrix M (Latin Square):\n");
-        for (i = 0; i < n; i++){
-            for (j = 0; j < n; j++){
-                printf("%.2lf ", M[i][j]);
+            // Unpad product matrix P_pad into P (n x n).
+            double **P = allocateMatrix(n);
+            if (m != n) {
+                unpadMatrix(P_pad, P, n, m);
+            } else {
+                for (int i = 0; i < n; i++)
+                    for (int j = 0; j < n; j++)
+                        P[i][j] = P_pad[i][j];
             }
-            printf("\n");
-        }
 
-        // Print matrix P (M * M).
-        printf("\nMatrix P (M * M):\n");
-        for (i = 0; i < n; i++){
-            for (j = 0; j < n; j++){
-                printf("%.2lf ", P[i][j]);
+            // Compute the minimum and maximum entries in P.
+            double minP = P[0][0], maxP = P[0][0];
+            for (int i = 0; i < n; i++){
+                for (int j = 0; j < n; j++){
+                    if (P[i][j] < minP)
+                        minP = P[i][j];
+                    if (P[i][j] > maxP)
+                        maxP = P[i][j];
+                }
             }
-            printf("\n");
-        }
 
-        // Check division by 0.0 and then normalize P.
-        if (max == 0.0) {
-            printf("\nNormalization skipped: largest element in the first row is 0.0 (division by zero).\n");
-        } else {
-            printf("\nNormalized Matrix P (each entry divided by %.2lf):\n", max);
-            for (i = 0; i < n; i++){
-                for (j = 0; j < n; j++){
-                    printf("%.2lf ", P[i][j] / max);
+            // Print Matrix M.
+            printf("\nMatrix M (Latin Square):\n");
+            for (int i = 0; i < n; i++){
+                for (int j = 0; j < n; j++){
+                    printf("%.2lf ", M[i][j]);
                 }
                 printf("\n");
             }
-        }
 
-        // Free allocated memory.
+            // Normalize and print Matrix P using the affine mapping.
+            if (fabs(maxP - minP) < 1e-12) {
+                printf("\nNormalization skipped: max and min are equal (division by zero).\n");
+            } else {
+                printf("\nNormalized Matrix P (affine mapping: (P_{i,j} - %.2lf) / (%.2lf - %.2lf)):\n", minP, maxP, minP);
+                for (int i = 0; i < n; i++){
+                    for (int j = 0; j < n; j++){
+                        P[i][j] = (P[i][j] - minP) / (maxP - minP);
+                        printf("%.2lf ", P[i][j]);
+                    }
+                    printf("\n");
+                }
+            }
+
+            // If normalization was performed, check if the first row remains unchanged.
+            if (fabs(maxP - minP) >= 1e-12) {
+                int same = 1;
+                double epsilon = 1e-6;
+                for (int j = 0; j < n; j++) {
+                    if (fabs(vector[j] - P[0][j]) > epsilon) {
+                        same = 0;
+                        break;
+                    }
+                }
+                if (same) {
+                    printf("\nNormalized first row remained unchanged. Generating new random input vector.\n");
+                    for (int j = 0; j < n; j++) {
+                        double r = ((double)rand() / RAND_MAX) * 20.0 - 10.0;
+                        vector[j] = r;
+                    }
+                } else {
+                    // Update the input vector with the first row of the normalized matrix.
+                    for (int j = 0; j < n; j++) {
+                        vector[j] = P[0][j];
+                    }
+                }
+            } else {
+                printf("\nInput vector remains unchanged due to division by zero.\n");
+            }
+
+            // Free allocated memory.
+            freeMatrix(M, n);
+            if (m != n) {
+                freeMatrix(M_pad, m);
+            }
+            freeMatrix(P_pad, m);
+            freeMatrix(P, n);
+
+            iter++;
+        }
         free(vector);
-        freeMatrix(M, n);
-        if(m != n) {
-            freeMatrix(M_pad, m);
-        }
-        freeMatrix(P_pad, m);
-        freeMatrix(P, n);
+    } else {
+        // Manual input mode (loop indefinitely).
+        while (1) {
+            int n, i, j;
+            printf("\nEnter the size of the vector: ");
+            if (scanf("%d", &n) != 1 || n <= 0) {
+                printf("Invalid size. Please enter a positive integer.\n");
+                while(getchar() != '\n');
+                continue;
+            }
+            double *vector = (double *)malloc(n * sizeof(double));
+            if (!vector) {
+                printf("Memory allocation failed.\n");
+                exit(1);
+            }
+            printf("Enter %d vector element(s): ", n);
+            for (i = 0; i < n; i++) {
+                if (scanf("%lf", &vector[i]) != 1) {
+                    printf("Invalid input. Restarting iteration.\n");
+                    while(getchar() != '\n');
+                    free(vector);
+                    vector = NULL;
+                    break;
+                }
+            }
+            if (!vector)
+                continue;
 
-        printf("\n--------------------------------\n\n");
+            double **M = allocateMatrix(n);
+            for (i = 0; i < n; i++)
+                for (j = 0; j < n; j++)
+                    M[i][j] = vector[(j + i) % n];
+
+            int m = nextPowerOf2(n);
+            double **M_pad = (m == n) ? M : padMatrix(M, n, m);
+            double **P_pad = allocateMatrix(m);
+
+            #pragma omp parallel
+            {
+                #pragma omp single
+                {
+                    strassenMultiply(M_pad, M_pad, P_pad, m);
+                }
+            }
+
+            double **P = allocateMatrix(n);
+            if(m != n) {
+                unpadMatrix(P_pad, P, n, m);
+            } else {
+                for (i = 0; i < n; i++)
+                    for (j = 0; j < n; j++)
+                        P[i][j] = P_pad[i][j];
+            }
+
+            // Compute the minimum and maximum entries in P.
+            double minP = P[0][0], maxP = P[0][0];
+            for (i = 0; i < n; i++){
+                for (j = 0; j < n; j++){
+                    if (P[i][j] < minP)
+                        minP = P[i][j];
+                    if (P[i][j] > maxP)
+                        maxP = P[i][j];
+                }
+            }
+
+            printf("\nMatrix M (Latin Square):\n");
+            for (i = 0; i < n; i++){
+                for (j = 0; j < n; j++){
+                    printf("%.2lf ", M[i][j]);
+                }
+                printf("\n");
+            }
+
+            printf("\nMatrix P (M * M):\n");
+            for (i = 0; i < n; i++){
+                for (j = 0; j < n; j++){
+                    printf("%.2lf ", P[i][j]);
+                }
+                printf("\n");
+            }
+
+            // Normalize and print Matrix P using the affine mapping.
+            if (fabs(maxP - minP) < 1e-12) {
+                printf("\nNormalization skipped: max and min are equal (division by zero).\n");
+            } else {
+                printf("\nNormalized Matrix P (affine mapping: (P_{i,j} - %.2lf) / (%.2lf - %.2lf)):\n", minP, maxP, minP);
+                for (i = 0; i < n; i++){
+                    for (j = 0; j < n; j++){
+                        printf("%.2lf ", (P[i][j] - minP) / (maxP - minP));
+                    }
+                    printf("\n");
+                }
+            }
+
+            free(vector);
+            freeMatrix(M, n);
+            if(m != n) {
+                freeMatrix(M_pad, m);
+            }
+            freeMatrix(P_pad, m);
+            freeMatrix(P, n);
+
+            printf("\n--------------------------------\n\n");
+        }
     }
     return 0;
 }
